@@ -137,6 +137,8 @@ jobs:
           SOFT_SUB_FOLDER_ID: ${{ secrets.SOFT_SUB_FOLDER_ID }}
           STREAMP2P_API_KEY: ${{ secrets.STREAMP2P_API_KEY }}
           STREAMP2P_PLAYER_URL: ${{ vars.STREAMP2P_PLAYER_URL || '' }}
+          STREAMP2P_FOLDER_ID: ${{ secrets.STREAMP2P_FOLDER_ID || '' }}
+          STREAMP2P_ENABLED: ${{ secrets.STREAMP2P_API_KEY != '' && '1' || '0' }}
           HTML_FILE: index.html
 
           MAGNET_LINKS: ${{ github.event.inputs.magnet_links || '' }}
