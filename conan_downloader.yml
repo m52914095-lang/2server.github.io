@@ -1,0 +1,155 @@
+name: Detective Conan - Auto Downloader
+
+"on":
+  schedule:
+    - cron: '0 13 * * 6'
+
+  workflow_dispatch:
+    inputs:
+      magnet_links:
+        description: |
+          [MAGNETS] Video magnets. One per line.
+          Leave blank to use Nyaa search.
+        required: false
+        default: ''
+
+      subtitle_magnet_links:
+        description: |
+          [SUBTITLES] Subtitle magnets. One per line.
+          Use this for separate subtitle torrents.
+        required: false
+        default: ''
+
+      select_files:
+        description: |
+          [MAGNETS] Optional aria2 select-file list for video torrents.
+          Examples: 1,3,5 or 1-4.
+        required: false
+        default: ''
+
+      subtitle_select_files:
+        description: |
+          [SUBTITLES] Optional aria2 select-file list for subtitle torrents.
+          Examples: 1,3,5 or 1-4.
+        required: false
+        default: ''
+
+      episode_override:
+        description: |
+          [EPISODES] Specific episode or range.
+          Examples: 1194 or 1194-1196 or 1194,1196.
+        required: false
+        default: ''
+
+      nyaa_uploader_url:
+        description: |
+          [EPISODES] Optional Nyaa uploader page URL.
+          Example: https://nyaa.si/user/Erai-raws
+        required: false
+        default: ''
+
+      custom_search_query:
+        description: |
+          [EPISODES] Optional custom Nyaa search query.
+        required: false
+        default: ''
+
+      ep_hs_title:
+        description: |
+          [EPISODES] Hard-sub DoodStream title template.
+          Use {ep} as the episode placeholder.
+        required: false
+        default: 'Detective Conan - {ep} HS'
+
+      ep_ss_title:
+        description: |
+          [EPISODES] Soft-sub DoodStream title template.
+          Use {ep} as the episode placeholder.
+        required: false
+        default: 'Detective Conan - {ep} SS'
+
+      movie_mode:
+        description: |
+          [MOVIES] Force all files to be treated as movies.
+          Set to 1 only when needed.
+        required: false
+        default: '0'
+
+      movie_hs_title:
+        description: |
+          [MOVIES] Hard-sub DoodStream title template.
+          Use {num} as the movie placeholder.
+        required: false
+        default: 'Detective Conan Movie - {num} HS'
+
+      movie_ss_title:
+        description: |
+          [MOVIES] Soft-sub DoodStream title template.
+          Use {num} as the movie placeholder.
+        required: false
+        default: 'Detective Conan Movie - {num} SS'
+
+env:
+  BASE_EPISODE: '1193'
+  BASE_DATE: '2026-03-14'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Free disk space on runner
+        run: |
+          echo "Disk before cleanup"
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup"
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 ffmpeg unzip
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run Conan automation
+        run: python conan_automation_github.py
+        env:
+          DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+          HARD_SUB_FOLDER_ID: ${{ secrets.HARD_SUB_FOLDER_ID }}
+          SOFT_SUB_FOLDER_ID: ${{ secrets.SOFT_SUB_FOLDER_ID }}
+          STREAMP2P_API_KEY: ${{ secrets.STREAMP2P_API_KEY }}
+          STREAMP2P_PLAYER_URL: ${{ vars.STREAMP2P_PLAYER_URL || '' }}
+          HTML_FILE: index.html
+
+          MAGNET_LINKS: ${{ github.event.inputs.magnet_links || '' }}
+          SUBTITLE_MAGNET_LINKS: ${{ github.event.inputs.subtitle_magnet_links || '' }}
+          SELECT_FILES: ${{ github.event.inputs.select_files || '' }}
+          SUBTITLE_SELECT_FILES: ${{ github.event.inputs.subtitle_select_files || '' }}
+
+          EPISODE_OVERRIDE: ${{ github.event.inputs.episode_override || '' }}
+          NYAA_UPLOADER_URL: ${{ github.event.inputs.nyaa_uploader_url || '' }}
+          CUSTOM_SEARCH: ${{ github.event.inputs.custom_search_query || '' }}
+          HS_TITLE_TPL: ${{ github.event.inputs.ep_hs_title || 'Detective Conan - {ep} HS' }}
+          SS_TITLE_TPL: ${{ github.event.inputs.ep_ss_title || 'Detective Conan - {ep} SS' }}
+
+          MOVIE_MODE: ${{ github.event.inputs.movie_mode || '0' }}
+          MOVIE_HS_TITLE_TPL: ${{ github.event.inputs.movie_hs_title || 'Detective Conan Movie - {num} HS' }}
+          MOVIE_SS_TITLE_TPL: ${{ github.event.inputs.movie_ss_title || 'Detective Conan Movie - {num} SS' }}

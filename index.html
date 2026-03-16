@@ -486,7 +486,7 @@
         <!-- Main -->
         <div class="main-col">
           <div class="video-shell glow" id="videoShell">
-            <iframe id="mainPlayer" src="" allowfullscreen></iframe>
+            <iframe id="mainPlayer" src="" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
             <div class="coming-soon-overlay hidden" id="comingSoonOverlay">Coming Soon</div>
           </div>
 
@@ -2832,6 +2832,88 @@ function decryptUrl(encrypted) {
     }
 
 
+    const playerApiState = { ready:false, status:'', currentTime:0, duration:0 };
+
+    function isStreamP2PUrl(url){
+      try{
+        const u = new URL(url, window.location.href);
+        return /(^|\.)playerp2p\.com$/i.test(u.hostname) || /(^|\.)streamp2p\.com$/i.test(u.hostname);
+      }catch(_){
+        return false;
+      }
+    }
+
+    function withPlayerApiParam(url){
+      if(!url || !isStreamP2PUrl(url)) return url || '';
+      const hostValue = window.location.hostname || window.location.host || '';
+      if(!hostValue) return url;
+      try{
+        const u = new URL(url, window.location.href);
+        if(u.hash){
+          let hash = u.hash.startsWith('#') ? u.hash.slice(1) : u.hash;
+          hash = hash.replace(/(^|&)api=[^&]*/g, '$1').replace(/^&+|&+$/g, '').replace(/&&+/g, '&');
+          u.hash = hash ? `#${hash}&api=${encodeURIComponent(hostValue)}` : `#api=${encodeURIComponent(hostValue)}`;
+          return u.toString();
+        }
+        u.searchParams.set('api', hostValue);
+        return u.toString();
+      }catch(_){
+        return url;
+      }
+    }
+
+    function setMainPlayerUrl(url){
+      const iframe = document.getElementById('mainPlayer');
+      if(!iframe) return;
+      iframe.src = withPlayerApiParam(url || '');
+    }
+
+    function getMainPlayerOrigin(){
+      const iframe = document.getElementById('mainPlayer');
+      if(!iframe || !iframe.src) return '';
+      try{
+        return new URL(iframe.src, window.location.href).origin;
+      }catch(_){
+        return '';
+      }
+    }
+
+    function postToMainPlayer(command, value){
+      const iframe = document.getElementById('mainPlayer');
+      const targetOrigin = getMainPlayerOrigin();
+      if(!iframe || !iframe.contentWindow || !targetOrigin || !isStreamP2PUrl(iframe.src)) return false;
+      const payload = { command: command };
+      if(value !== undefined) payload.value = value;
+      iframe.contentWindow.postMessage(payload, targetOrigin);
+      return true;
+    }
+
+    window.streamP2PPlayerApi = {
+      seek(value){ return postToMainPlayer('seek', value); },
+      play(){ return postToMainPlayer('play'); },
+      pause(){ return postToMainPlayer('pause'); },
+      mute(){ return postToMainPlayer('mute'); },
+      unmute(){ return postToMainPlayer('unmute'); },
+      volume(value){ return postToMainPlayer('volume', value); },
+      getStatus(){ return postToMainPlayer('getStatus'); },
+      getTime(){ return postToMainPlayer('getTime'); },
+      state: playerApiState
+    };
+
+    window.addEventListener('message', (e) => {
+      const iframe = document.getElementById('mainPlayer');
+      if(!iframe || !iframe.src || !isStreamP2PUrl(iframe.src)) return;
+      const targetOrigin = getMainPlayerOrigin();
+      if(!targetOrigin || e.origin !== targetOrigin) return;
+      const data = e.data || {};
+      if(data.playerStatus !== undefined){
+        playerApiState.status = data.playerStatus;
+        if(data.playerStatus === 'Ready') playerApiState.ready = true;
+      }
+      if(data.currentTime !== undefined) playerApiState.currentTime = data.currentTime;
+      if(data.duration !== undefined) playerApiState.duration = data.duration;
+    });
+
     function showWatchSidebar(which){
       const epSb = document.getElementById('epSidebar');
       const infoSb = document.getElementById('infoSidebar');
@@ -2980,11 +3062,11 @@ function decryptUrl(encrypted) {
 
       if(!s.url){
         setComingSoonOverlay(true);
-        document.getElementById('mainPlayer').src = '';
+        setMainPlayerUrl('');
         openModal('noLinkModal');
       }else{
         setComingSoonOverlay(false);
-        document.getElementById('mainPlayer').src = s.url;
+        setMainPlayerUrl(s.url);
       }
     }
 
@@ -3023,7 +3105,7 @@ function decryptUrl(encrypted) {
         setComingSoonOverlay(true);
       }else{
         setComingSoonOverlay(false);
-        document.getElementById('mainPlayer').src = o.url;
+        setMainPlayerUrl(o.url);
       }
     }
 
@@ -3061,7 +3143,7 @@ function decryptUrl(encrypted) {
         setComingSoonOverlay(true);
       }else{
         setComingSoonOverlay(false);
-        document.getElementById('mainPlayer').src = s.url;
+        setMainPlayerUrl(s.url);
       }
     }
 
@@ -3228,11 +3310,11 @@ function decryptUrl(encrypted) {
       if(url){
         notes.textContent = `Using your saved embed link on ${state.server === 's2' ? 'Server 2' : 'Server 1'}.`;
         setComingSoonOverlay(false);
-        document.getElementById('mainPlayer').src = url;
+        setMainPlayerUrl(url);
       }else{
         notes.textContent = `Coming Soon — Add your ${state.mode} ${state.type} embed link for Episode ${ep} on ${state.server === 's2' ? 'Server 2' : 'Server 1'}.`;
         setComingSoonOverlay(true);
-        document.getElementById('mainPlayer').src = "";
+        setMainPlayerUrl('');
       }
     }
 
@@ -3298,11 +3380,11 @@ function decryptUrl(encrypted) {
       if(url){
         notes.textContent = `Using your saved embed link on ${state.server === 's2' ? 'Server 2' : 'Server 1'}.`;
         setComingSoonOverlay(false);
-        document.getElementById('mainPlayer').src = url;
+        setMainPlayerUrl(url);
       }else{
         notes.textContent = `Coming Soon — Add a ${state.mode} ${state.type} link for Movie ${m.id} on ${state.server === 's2' ? 'Server 2' : 'Server 1'}.`;
         setComingSoonOverlay(true);
-        document.getElementById('mainPlayer').src = "";
+        setMainPlayerUrl('');
       }
     }
 
