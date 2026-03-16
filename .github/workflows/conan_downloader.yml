@@ -89,9 +89,6 @@ name: Detective Conan - Auto Downloader
         required: false
         default: 'Detective Conan Movie - {num} SS'
 
-permissions:
-  contents: write
-
 env:
   BASE_EPISODE: '1193'
   BASE_DATE: '2026-03-14'
@@ -136,9 +133,10 @@ jobs:
         run: python conan_automation_github.py
         env:
           DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
-          STREAMP2P_API_KEY: ${{ secrets.STREAMP2P_API_KEY }}
           HARD_SUB_FOLDER_ID: ${{ secrets.HARD_SUB_FOLDER_ID }}
           SOFT_SUB_FOLDER_ID: ${{ secrets.SOFT_SUB_FOLDER_ID }}
+          STREAMP2P_API_KEY: ${{ secrets.STREAMP2P_API_KEY }}
+          STREAMP2P_PLAYER_URL: ${{ vars.STREAMP2P_PLAYER_URL || '' }}
           HTML_FILE: index.html
 
           MAGNET_LINKS: ${{ github.event.inputs.magnet_links || '' }}
