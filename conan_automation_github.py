@@ -13,8 +13,10 @@ Added features:
 - ASCII-only source file
 """
 
+import base64
 import glob
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -22,30 +24,21 @@ import sys
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-from update import (
-    bulk_sync,
-    patch_hs,
-    patch_hs2,
-    patch_movie_hs,
-    patch_movie_hs2,
-    patch_movie_ss,
-    patch_movie_ss2,
-    patch_ss,
-    patch_ss2,
-    read_html,
-    write_html,
-)
+from update import bulk_sync, patch_hs, patch_movie_hs, patch_movie_ss, patch_ss, read_html, write_html
 
 # Config
-DOODSTREAM_API_KEY = os.environ.get("DOODSTREAM_API_KEY", "").strip()
+DOODSTREAM_API_KEY = os.environ.get("DOODSTREAM_API_KEY", "554366xrjxeza9m7e4m02v")
 HARD_SUB_FOLDER_ID = os.environ.get("HARD_SUB_FOLDER_ID", "")
 SOFT_SUB_FOLDER_ID = os.environ.get("SOFT_SUB_FOLDER_ID", "")
 STREAMP2P_API_KEY = os.environ.get("STREAMP2P_API_KEY", "").strip()
 STREAMP2P_PLAYER_URL = os.environ.get("STREAMP2P_PLAYER_URL", "").strip()
+STREAMP2P_FOLDER_ID = os.environ.get("STREAMP2P_FOLDER_ID", "").strip()
+STREAMP2P_ENABLED = os.environ.get("STREAMP2P_ENABLED", "1").strip() != "0" and bool(STREAMP2P_API_KEY)
 
 BASE_EPISODE = int(os.environ.get("BASE_EPISODE", "1193"))
 BASE_DATE = os.environ.get("BASE_DATE", "2026-03-14")
@@ -70,19 +63,17 @@ HTML_FILE = os.environ.get("HTML_FILE", "index.html")
 UPLOAD_RETRIES = 3
 RETRY_DELAY = 10
 ARIA2_TIMEOUT = 7200
+STREAMP2P_CHUNK_SIZE = 52_428_800
+STREAMP2P_POLL_SECONDS = 15
+STREAMP2P_POLL_TIMEOUT = 1800
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}
 SUBTITLE_EXTENSIONS = {".ass", ".ssa", ".srt", ".vtt", ".sub", ".sup"}
 ZIP_EXTENSIONS = {".zip"}
 ENGLISH_TAGS = {"eng", "en", "english"}
 
-STREAM_API_BASE = "https://streamp2p.com/api/v1"
-STREAM_POLL_DELAY = 8
-STREAM_POLL_ATTEMPTS = 75
-STREAM_HTTP_TIMEOUT = 60
-
 _upload_server_url: str | None = None
-_stream_player_base_url: str | None = None
+_streamp2p_auth_checked = False
 
 
 # Parsing helpers
@@ -632,423 +623,303 @@ def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
 
 
 
-# StreamP2P helpers
+# StreamP2P upload helpers
 
-def streamp2p_enabled() -> bool:
-    return bool(STREAMP2P_API_KEY)
+def guess_video_mime(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".mp4":
+        return "video/mp4"
+    if ext == ".mkv":
+        return "video/x-matroska"
+    if ext == ".mov":
+        return "video/quicktime"
+    if ext == ".avi":
+        return "video/x-msvideo"
+    if ext == ".m4v":
+        return "video/x-m4v"
+    guessed = mimetypes.guess_type(file_path)[0]
+    return guessed or "application/octet-stream"
 
 
-def _streamp2p_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {STREAMP2P_API_KEY}",
-        "Accept": "application/json",
-    }
+def _b64_tus(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
-def _normalize_player_base_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    if not raw.startswith(("http://", "https://")):
-        raw = "https://" + raw.lstrip("/")
+def streamp2p_headers() -> dict[str, str]:
+    token = STREAMP2P_API_KEY.strip().strip('"').strip("'")
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return {"api-token": token, "Accept": "application/json"}
+
+
+def streamp2p_auth_test() -> bool:
+    global _streamp2p_auth_checked
+    if not STREAMP2P_ENABLED:
+        return False
+    if _streamp2p_auth_checked:
+        return True
+
     try:
-        parsed = requests.utils.urlparse(raw)
-    except Exception:
-        return None
-    if not parsed.netloc:
-        return None
-    path = parsed.path.rstrip("/")
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
-
-
-def _walk_json(value: Any):
-    if isinstance(value, dict):
-        yield value
-        for item in value.values():
-            yield from _walk_json(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_json(item)
-
-
-def _collect_url_candidates(value: Any) -> list[str]:
-    found: list[str] = []
-    for item in _walk_json(value):
-        if isinstance(item, dict):
-            for candidate in item.values():
-                if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
-                    found.append(candidate)
-        elif isinstance(item, str) and item.startswith(("http://", "https://")):
-            found.append(item)
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for candidate in found:
-        if candidate not in seen:
-            seen.add(candidate)
-            ordered.append(candidate)
-    return ordered
-
-
-def _collect_named_ids(value: Any) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for item in _walk_json(value):
-        if not isinstance(item, dict):
-            continue
-        for key, candidate in item.items():
-            if key.lower() in {
-                "id",
-                "videoid",
-                "video_id",
-                "taskid",
-                "task_id",
-                "uploadid",
-                "upload_id",
-            }:
-                if candidate is None:
-                    continue
-                found.setdefault(key.lower(), []).append(str(candidate))
-        videos = item.get("videos")
-        if isinstance(videos, list):
-            for candidate in videos:
-                if candidate is not None:
-                    found.setdefault("videos", []).append(str(candidate))
-    return found
-
-
-def _extract_streamp2p_upload_targets(payload: Any) -> list[dict[str, Any]]:
-    targets: list[dict[str, Any]] = []
-    for item in _walk_json(payload):
-        if not isinstance(item, dict):
-            continue
-        url = None
-        for key in ("url", "uploadUrl", "uploadURL", "endpoint", "uploadEndpoint", "server"):
-            candidate = item.get(key)
-            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
-                url = candidate
-                break
-        if not url:
-            continue
-        target = {
-            "url": url,
-            "method": str(item.get("method") or "POST").upper(),
-            "fields": item.get("fields") if isinstance(item.get("fields"), dict) else {},
-            "headers": item.get("headers") if isinstance(item.get("headers"), dict) else {},
-            "file_field": item.get("fileField") or item.get("file_field") or "file",
-        }
-        targets.append(target)
-
-    if not targets:
-        for url in _collect_url_candidates(payload):
-            if "/upload" in url:
-                targets.append({"url": url, "method": "POST", "fields": {}, "headers": {}, "file_field": "file"})
-
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for target in targets:
-        key = (target["method"], target["url"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(target)
-
-    def _target_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        url = item["url"]
-        is_api = 1 if "/api/v1/video/upload" in url else 0
-        is_cloudflare = 1 if "streamp2p.com/api/" in url else 0
-        return (is_api + is_cloudflare, 0 if item["method"] == "POST" else 1, url)
-
-    return sorted(deduped, key=_target_sort_key)
-
-
-def _streamp2p_request(method: str, path: str, timeout: int = STREAM_HTTP_TIMEOUT, **kwargs) -> requests.Response:
-    headers = _streamp2p_headers()
-    extra_headers = kwargs.pop("headers", {}) or {}
-    headers.update(extra_headers)
-    return requests.request(method, f"{STREAM_API_BASE}{path}", headers=headers, timeout=timeout, **kwargs)
-
-
-def _streamp2p_get_json(path: str, timeout: int = STREAM_HTTP_TIMEOUT) -> Any | None:
-    try:
-        response = _streamp2p_request("GET", path, timeout=timeout)
+        response = requests.get(
+            "https://streamp2p.com/api/v1/user/information",
+            headers=streamp2p_headers(),
+            timeout=30,
+        )
+        preview = response.text[:200].replace("\n", " ")
+        print(f"  StreamP2P auth test: {response.status_code} {preview}")
         response.raise_for_status()
-        return response.json()
+        _streamp2p_auth_checked = True
+        return True
     except Exception as exc:
-        print(f"  StreamP2P GET {path} failed: {exc}", file=sys.stderr)
-        return None
+        print(f"  StreamP2P auth failed: {exc}", file=sys.stderr)
+        return False
 
 
-def _get_streamp2p_player_base() -> str | None:
-    global _stream_player_base_url
-    if _stream_player_base_url:
-        return _stream_player_base_url
-    if STREAMP2P_PLAYER_URL:
-        _stream_player_base_url = _normalize_player_base_url(STREAMP2P_PLAYER_URL)
-        if _stream_player_base_url:
-            return _stream_player_base_url
-
-    payload = _streamp2p_get_json("/video/player/default")
-    if payload is None:
-        return None
-
-    for url in _collect_url_candidates(payload):
-        normalized = _normalize_player_base_url(url)
-        if normalized:
-            _stream_player_base_url = normalized
-            return _stream_player_base_url
-
-    for item in _walk_json(payload):
-        if not isinstance(item, dict):
-            continue
-        for key in ("domain", "hostname", "host", "subdomain"):
-            candidate = item.get(key)
-            if not isinstance(candidate, str):
-                continue
-            if "." in candidate and " " not in candidate:
-                normalized = _normalize_player_base_url(candidate)
-                if normalized:
-                    _stream_player_base_url = normalized
-                    return _stream_player_base_url
-    return None
-
-
-def _build_streamp2p_embed_url(video_id: str) -> str | None:
-    base = _get_streamp2p_player_base()
-    if not base or not video_id:
-        return None
-    if "#" in base:
-        return base.split("#", 1)[0] + f"#{video_id}"
-    return base.rstrip("/") + f"/#{video_id}".replace("/#", "#")
-
-
-def _extract_streamp2p_play_url(payload: Any, fallback_video_id: str = "") -> str | None:
-    urls = _collect_url_candidates(payload)
-    preferred: list[str] = []
-    fallback: list[str] = []
-    for url in urls:
-        lower = url.lower()
-        if any(token in lower for token in ("playerp2p.com", "streamp2p.com/e/", "embed", "/play", "#")):
-            preferred.append(url)
-        else:
-            fallback.append(url)
-    if preferred:
-        return preferred[0]
-    if fallback_video_id:
-        built = _build_streamp2p_embed_url(fallback_video_id)
-        if built:
-            return built
-    if fallback:
-        return fallback[0]
-    return None
-
-
-def _streamp2p_rename_video(video_id: str, title: str) -> None:
-    if not video_id or not title:
-        return
+def get_streamp2p_upload_target() -> tuple[str | None, str | None]:
     try:
-        response = _streamp2p_request("PATCH", f"/video/manage/{video_id}", json={"name": title})
-        if response.status_code not in (200, 204):
-            print(f"  StreamP2P rename returned {response.status_code}: {response.text[:200]}", file=sys.stderr)
+        response = requests.get(
+            "https://streamp2p.com/api/v1/video/upload",
+            headers=streamp2p_headers(),
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        tus_url = data.get("tusUrl") or (data.get("result") or {}).get("tusUrl")
+        access_token = data.get("accessToken") or (data.get("result") or {}).get("accessToken")
+        if tus_url and access_token:
+            return str(tus_url), str(access_token)
+        print(f"  StreamP2P upload target response missing fields: {data}", file=sys.stderr)
     except Exception as exc:
-        print(f"  StreamP2P rename error: {exc}", file=sys.stderr)
-
-
-def _streamp2p_video_detail(video_id: str) -> Any | None:
-    if not video_id:
-        return None
-    return _streamp2p_get_json(f"/video/manage/{video_id}")
-
-
-def _streamp2p_resolve_video_id_from_task(task_id: str) -> str | None:
-    if not task_id:
-        return None
-    for attempt in range(1, STREAM_POLL_ATTEMPTS + 1):
-        payload = _streamp2p_get_json(f"/video/advance-upload/{task_id}")
-        if not payload:
-            time.sleep(STREAM_POLL_DELAY)
-            continue
-        ids = _collect_named_ids(payload)
-        videos = ids.get("videos") or []
-        if videos:
-            return videos[0]
-        status = str((payload or {}).get("status") or "").strip().lower()
-        error_message = str((payload or {}).get("error") or "").strip()
-        if error_message:
-            print(f"  StreamP2P task error: {error_message}", file=sys.stderr)
-            return None
-        if status in {"completed", "done", "ready", "success"}:
-            generic_id = (ids.get("videoid") or ids.get("video_id") or ids.get("id") or [None])[0]
-            if generic_id:
-                return generic_id
-        print(f"  StreamP2P task {task_id}: waiting ({attempt}/{STREAM_POLL_ATTEMPTS}) status='{status or 'pending'}'")
-        time.sleep(STREAM_POLL_DELAY)
-    return None
-
-
-def _streamp2p_finalize_upload(payload: Any, title: str) -> tuple[str | None, str | None]:
-    if payload is None:
-        return None, None
-
-    video_id = None
-    ids = _collect_named_ids(payload)
-    if ids.get("videos"):
-        video_id = ids["videos"][0]
-    elif ids.get("videoid"):
-        video_id = ids["videoid"][0]
-    elif ids.get("video_id"):
-        video_id = ids["video_id"][0]
-
-    task_id = None
-    if ids.get("taskid"):
-        task_id = ids["taskid"][0]
-    elif ids.get("task_id"):
-        task_id = ids["task_id"][0]
-    elif ids.get("uploadid"):
-        task_id = ids["uploadid"][0]
-    elif ids.get("upload_id"):
-        task_id = ids["upload_id"][0]
-
-    generic_id = (ids.get("id") or [None])[0]
-    direct_url = _extract_streamp2p_play_url(payload, video_id or "")
-    if direct_url and video_id:
-        _streamp2p_rename_video(video_id, title)
-        return direct_url, video_id
-
-    if not video_id and task_id:
-        video_id = _streamp2p_resolve_video_id_from_task(task_id)
-    if not video_id and generic_id:
-        maybe_task_video = _streamp2p_resolve_video_id_from_task(generic_id)
-        if maybe_task_video:
-            video_id = maybe_task_video
-        else:
-            video_id = generic_id
-
-    if video_id:
-        _streamp2p_rename_video(video_id, title)
-        detail = _streamp2p_video_detail(video_id)
-        detail_url = _extract_streamp2p_play_url(detail, video_id)
-        if detail_url:
-            return detail_url, video_id
-        built_url = _build_streamp2p_embed_url(video_id)
-        if built_url:
-            return built_url, video_id
-
-    return direct_url, video_id
-
-
-def _streamp2p_request_upload_targets() -> list[dict[str, Any]]:
-    if not streamp2p_enabled():
-        return []
-    payload = _streamp2p_get_json("/video/upload")
-    if payload is None:
-        return []
-    targets = _extract_streamp2p_upload_targets(payload)
-    if not targets:
-        print("  StreamP2P upload endpoint list was empty", file=sys.stderr)
-    else:
-        print(f"  StreamP2P upload target count: {len(targets)}")
-    return targets
-
-
-def _upload_to_streamp2p_target(file_path: str, target: dict[str, Any], title: str) -> tuple[str | None, str | None]:
-    file_name = os.path.basename(file_path)
-    mime_type = "video/mp4" if file_name.lower().endswith(".mp4") else "application/octet-stream"
-    method = str(target.get("method") or "POST").upper()
-    url = str(target.get("url") or "")
-    data = dict(target.get("fields") or {})
-    headers = dict(target.get("headers") or {})
-    file_field = str(target.get("file_field") or "file")
-
-    if not url:
-        return None, None
-
-    with open(file_path, "rb") as fh:
-        if method == "PUT" and not data:
-            upload_headers = dict(headers)
-            upload_headers.setdefault("Content-Type", mime_type)
-            response = requests.put(url, data=fh, headers=upload_headers, timeout=ARIA2_TIMEOUT)
-        else:
-            files = {file_field: (file_name, fh, mime_type)}
-            response = requests.request(method, url, data=data, files=files, headers=headers, timeout=ARIA2_TIMEOUT)
-
-    payload = None
-    try:
-        payload = response.json()
-    except Exception:
-        snippet = (response.text or "").strip()
-        if snippet:
-            print(f"  StreamP2P non-JSON response: {snippet[:400]}", file=sys.stderr)
-
-    if response.status_code not in (200, 201, 202, 204):
-        print(f"  StreamP2P bad response ({response.status_code}): {payload or {}}", file=sys.stderr)
-        return None, None
-
-    if payload is None:
-        payload = {"location": response.headers.get("Location") or response.headers.get("location") or ""}
-
-    return _streamp2p_finalize_upload(payload, title)
-
-
-def upload_streamp2p_file(file_path: str, title: str) -> tuple[str | None, str | None]:
-    if not streamp2p_enabled():
-        return None, None
-
-    size_mb = os.path.getsize(file_path) // (1024 * 1024)
-    print(f"  StreamP2P uploading '{title}' ({size_mb} MB)...")
-
-    for attempt in range(1, UPLOAD_RETRIES + 1):
-        targets = _streamp2p_request_upload_targets()
-        if not targets:
-            print(f"  [attempt {attempt}] StreamP2P did not return upload targets", file=sys.stderr)
-            if attempt < UPLOAD_RETRIES:
-                time.sleep(RETRY_DELAY)
-            continue
-
-        for target in targets:
-            print(f"  [attempt {attempt}] StreamP2P target: {target['url']} ({target['method']})")
-            try:
-                url, video_id = _upload_to_streamp2p_target(file_path, target, title)
-                if url or video_id:
-                    resolved_url = url or (_build_streamp2p_embed_url(video_id or "") if video_id else None)
-                    if resolved_url:
-                        print(f"  StreamP2P uploaded! {resolved_url}")
-                        return resolved_url, video_id
-            except Exception as exc:
-                print(f"  [attempt {attempt}] StreamP2P exception: {exc}", file=sys.stderr)
-
-        if attempt < UPLOAD_RETRIES:
-            print(f"  StreamP2P retrying in {RETRY_DELAY}s...")
-            time.sleep(RETRY_DELAY)
-
-    print(f"  All {UPLOAD_RETRIES} StreamP2P attempts failed for '{title}'", file=sys.stderr)
+        print(f"  StreamP2P GET /video/upload failed: {exc}", file=sys.stderr)
     return None, None
 
 
-def upload_streamp2p_subtitle(video_id: str, subtitle_path: str | None) -> None:
-    if not streamp2p_enabled() or not video_id or not subtitle_path or not os.path.exists(subtitle_path):
-        return
-    ext = os.path.splitext(subtitle_path)[1].lower().lstrip(".") or "srt"
-    data = {"language": "en", "label": "English", "type": ext}
+def _tus_metadata(access_token: str, filename: str, filetype: str, folder_id: str = "") -> str:
+    entries = [
+        f"accessToken {_b64_tus(access_token)}",
+        f"filename {_b64_tus(filename)}",
+        f"filetype {_b64_tus(filetype)}",
+    ]
+    if folder_id:
+        entries.append(f"folderId {_b64_tus(folder_id)}")
+    return ",".join(entries)
+
+
+def _create_tus_upload(tus_url: str, access_token: str, upload_name: str, filetype: str, file_size: int, folder_id: str = "") -> str | None:
+    headers = {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Length": str(file_size),
+        "Upload-Metadata": _tus_metadata(access_token, upload_name, filetype, folder_id),
+        "Content-Length": "0",
+    }
+    response = requests.post(tus_url, headers=headers, timeout=60)
+    response.raise_for_status()
+    location = response.headers.get("Location") or response.headers.get("location")
+    if not location:
+        print(f"  StreamP2P TUS create missing Location header: {dict(response.headers)}", file=sys.stderr)
+        return None
+    return urljoin(tus_url, location)
+
+
+def _patch_tus_chunks(upload_url: str, file_path: str) -> bool:
+    offset = 0
+    file_size = os.path.getsize(file_path)
+    with open(file_path, "rb") as fh:
+        while offset < file_size:
+            chunk = fh.read(STREAMP2P_CHUNK_SIZE)
+            if not chunk:
+                break
+            headers = {
+                "Tus-Resumable": "1.0.0",
+                "Upload-Offset": str(offset),
+                "Content-Type": "application/offset+octet-stream",
+            }
+            response = requests.patch(upload_url, headers=headers, data=chunk, timeout=ARIA2_TIMEOUT)
+            response.raise_for_status()
+            server_offset = response.headers.get("Upload-Offset") or response.headers.get("upload-offset")
+            if server_offset is not None:
+                offset = int(server_offset)
+            else:
+                offset += len(chunk)
+            print(f"    StreamP2P uploaded {offset}/{file_size} bytes")
+
+    verify = requests.head(upload_url, headers={"Tus-Resumable": "1.0.0"}, timeout=30)
+    verify.raise_for_status()
+    final_offset = int(verify.headers.get("Upload-Offset") or verify.headers.get("upload-offset") or "0")
+    if final_offset != file_size:
+        print(f"  StreamP2P upload verification mismatch: {final_offset} != {file_size}", file=sys.stderr)
+        return False
+    return True
+
+
+def _extract_rows_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("results", "items", "rows", "videos", "data", "list"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+        if isinstance(value, dict):
+            nested = _extract_rows_from_payload(value)
+            if nested:
+                return nested
+
+    for value in payload.values():
+        if isinstance(value, dict):
+            nested = _extract_rows_from_payload(value)
+            if nested:
+                return nested
+        if isinstance(value, list) and value and all(isinstance(row, dict) for row in value):
+            return list(value)
+    return []
+
+
+def _row_title(row: dict[str, Any]) -> str:
+    return str(row.get("title") or row.get("name") or row.get("filename") or row.get("originalName") or "").strip()
+
+
+def _row_video_id(row: dict[str, Any]) -> str:
+    for key in ("id", "videoId", "_id"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _row_player_url(row: dict[str, Any]) -> str:
+    for key in ("playerUrl", "embedUrl", "iframeUrl", "url", "publicUrl", "shareUrl"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _build_player_url(video_id: str) -> str:
+    base = STREAMP2P_PLAYER_URL.strip()
+    if not base or not video_id:
+        return ""
+    if "#" in base:
+        return f"{base}{video_id}"
+    return f"{base.rstrip('/')}/#{video_id}"
+
+
+def find_streamp2p_video(title: str, upload_name: str, timeout_seconds: int = STREAMP2P_POLL_TIMEOUT) -> tuple[str | None, str | None]:
+    deadline = time.time() + timeout_seconds
+    title_lower = title.lower().strip()
+    upload_stem = os.path.splitext(os.path.basename(upload_name))[0].lower().strip()
+
+    while time.time() < deadline:
+        for query in (title, upload_name, upload_stem):
+            if not query:
+                continue
+            try:
+                response = requests.get(
+                    "https://streamp2p.com/api/v1/video/manage",
+                    headers=streamp2p_headers(),
+                    params={"search": query, "page": 1, "perPage": 100},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                rows = _extract_rows_from_payload(response.json())
+            except Exception as exc:
+                print(f"  StreamP2P list search failed for '{query}': {exc}", file=sys.stderr)
+                rows = []
+
+            exact_match = None
+            partial_match = None
+            for row in rows:
+                row_title = _row_title(row).lower()
+                if not row_title:
+                    continue
+                if row_title == title_lower or row_title == upload_stem:
+                    exact_match = row
+                    break
+                if title_lower in row_title or upload_stem in row_title:
+                    partial_match = partial_match or row
+            chosen = exact_match or partial_match
+            if chosen:
+                video_id = _row_video_id(chosen)
+                player_url = _row_player_url(chosen) or _build_player_url(video_id)
+                return video_id or None, player_url or None
+
+        print("  Waiting for StreamP2P video to appear in /video/manage...")
+        time.sleep(STREAMP2P_POLL_SECONDS)
+
+    return None, None
+
+
+def upload_streamp2p_subtitle(video_id: str, subtitle_file: str) -> bool:
+    if not video_id or not subtitle_file or not os.path.exists(subtitle_file):
+        return False
     try:
-        with open(subtitle_path, "rb") as fh:
-            response = _streamp2p_request(
-                "PUT",
-                f"/video/manage/{video_id}/subtitle",
-                files={"file": (os.path.basename(subtitle_path), fh, "application/octet-stream")},
-                data=data,
+        mime = mimetypes.guess_type(subtitle_file)[0] or "application/octet-stream"
+        with open(subtitle_file, "rb") as fh:
+            response = requests.put(
+                f"https://streamp2p.com/api/v1/video/manage/{video_id}/subtitle",
+                headers={"api-token": streamp2p_headers()["api-token"]},
+                files={"file": (os.path.basename(subtitle_file), fh, mime)},
                 timeout=ARIA2_TIMEOUT,
             )
-        if response.status_code in (200, 201, 202, 204):
-            print(f"  StreamP2P subtitle attached: {os.path.basename(subtitle_path)}")
-        else:
-            print(f"  StreamP2P subtitle upload returned {response.status_code}: {response.text[:300]}", file=sys.stderr)
+        if response.ok:
+            print(f"  StreamP2P subtitle uploaded for video {video_id}")
+            return True
+        print(f"  StreamP2P subtitle upload failed: {response.status_code} {response.text[:300]}", file=sys.stderr)
     except Exception as exc:
-        print(f"  StreamP2P subtitle upload error: {exc}", file=sys.stderr)
+        print(f"  StreamP2P subtitle upload exception: {exc}", file=sys.stderr)
+    return False
 
+
+def upload_file_streamp2p(file_path: str, title: str, subtitle_file: str | None = None) -> str | None:
+    if not STREAMP2P_ENABLED:
+        return None
+    if not streamp2p_auth_test():
+        return None
+
+    file_size = os.path.getsize(file_path)
+    upload_name = f"{title}{os.path.splitext(file_path)[1].lower()}"
+    filetype = guess_video_mime(file_path)
+    print(f"  StreamP2P uploading '{upload_name}' ({file_size // (1024 * 1024)} MB)...")
+
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        try:
+            tus_url, access_token = get_streamp2p_upload_target()
+            if not tus_url or not access_token:
+                print(f"  [attempt {attempt}] StreamP2P did not return upload targets", file=sys.stderr)
+                raise RuntimeError("missing StreamP2P upload targets")
+
+            upload_url = _create_tus_upload(tus_url, access_token, upload_name, filetype, file_size, STREAMP2P_FOLDER_ID)
+            if not upload_url:
+                raise RuntimeError("could not create StreamP2P tus upload")
+
+            if not _patch_tus_chunks(upload_url, file_path):
+                raise RuntimeError("StreamP2P tus verification failed")
+
+            video_id, player_url = find_streamp2p_video(title, upload_name)
+            if subtitle_file and video_id:
+                upload_streamp2p_subtitle(video_id, subtitle_file)
+
+            if player_url:
+                print(f"  StreamP2P uploaded! {player_url}")
+            elif video_id:
+                print(f"  StreamP2P uploaded! video id: {video_id}")
+            else:
+                print("  StreamP2P upload finished, but no player URL was resolved yet")
+            return player_url or video_id
+        except Exception as exc:
+            print(f"  [attempt {attempt}] StreamP2P exception: {exc}", file=sys.stderr)
+            if attempt < UPLOAD_RETRIES:
+                print(f"  Retrying StreamP2P in {RETRY_DELAY}s...")
+                time.sleep(RETRY_DELAY)
+
+    print(f"  All {UPLOAD_RETRIES} StreamP2P attempts failed for '{title}'", file=sys.stderr)
+    return None
 
 # Per-file processing
 
-def process_file(video_file: str, subtitle_files: list[str]) -> dict[str, Any]:
+def process_file(video_file: str, subtitle_files: list[str]) -> tuple[int, bool, str | None, str | None]:
     number, is_movie = parse_file_info(video_file)
     if number is None:
         number = get_auto_episode()
@@ -1065,15 +936,8 @@ def process_file(video_file: str, subtitle_files: list[str]) -> dict[str, Any]:
     else:
         print("  No external subtitle match found; will use embedded subtitles if available")
 
-    result: dict[str, Any] = {
-        "number": number,
-        "is_movie": is_movie,
-        "dood_hs": None,
-        "dood_ss": None,
-        "s2_hs": None,
-        "s2_ss": None,
-    }
-
+    hs_url = None
+    ss_url = None
     ss_file = None
     hs_file = None
 
@@ -1081,11 +945,8 @@ def process_file(video_file: str, subtitle_files: list[str]) -> dict[str, Any]:
         ss_file = remux_to_mp4(video_file, label)
         if ss_file:
             title = MOVIE_SS_TITLE_TPL.format(num=number) if is_movie else SS_TITLE_TPL.format(ep=number)
-            result["dood_ss"] = upload_file(ss_file, title, SOFT_SUB_FOLDER_ID)
-            s2_url, s2_video_id = upload_streamp2p_file(ss_file, title)
-            result["s2_ss"] = s2_url
-            if s2_video_id and matched_subtitle:
-                upload_streamp2p_subtitle(s2_video_id, matched_subtitle)
+            ss_url = upload_file(ss_file, title, SOFT_SUB_FOLDER_ID)
+            upload_file_streamp2p(ss_file, title, matched_subtitle)
         else:
             print("  Remux failed - skipping SS upload", file=sys.stderr)
     except Exception as exc:
@@ -1101,9 +962,8 @@ def process_file(video_file: str, subtitle_files: list[str]) -> dict[str, Any]:
         hs_file = hardsub(video_file, label, matched_subtitle)
         if hs_file:
             title = MOVIE_HS_TITLE_TPL.format(num=number) if is_movie else HS_TITLE_TPL.format(ep=number)
-            result["dood_hs"] = upload_file(hs_file, title, HARD_SUB_FOLDER_ID)
-            s2_url, _s2_video_id = upload_streamp2p_file(hs_file, title)
-            result["s2_hs"] = s2_url
+            hs_url = upload_file(hs_file, title, HARD_SUB_FOLDER_ID)
+            upload_file_streamp2p(hs_file, title, None)
     except Exception as exc:
         print(f"  HS exception: {exc}", file=sys.stderr)
     finally:
@@ -1118,38 +978,28 @@ def process_file(video_file: str, subtitle_files: list[str]) -> dict[str, Any]:
     except OSError:
         pass
 
-    return result
+    return number, is_movie, hs_url, ss_url
 
 
 # HTML patching and git helpers
 
-def patch_html_batch(results: list[dict[str, Any]]) -> bool:
-    if not any(result.get(key) for result in results for key in ("dood_hs", "dood_ss", "s2_hs", "s2_ss")):
+def patch_html_batch(results: list[tuple[int, bool, str | None, str | None]]) -> bool:
+    if not any(hs or ss for _, _, hs, ss in results):
         print("\nNo URLs obtained - index.html unchanged.")
         return False
 
     html = read_html()
-    for result in results:
-        number = int(result["number"])
-        is_movie = bool(result["is_movie"])
+    for number, is_movie, hs_url, ss_url in results:
         if is_movie:
-            if result.get("dood_hs"):
-                html = patch_movie_hs(html, number, str(result["dood_hs"]))
-            if result.get("dood_ss"):
-                html = patch_movie_ss(html, number, str(result["dood_ss"]))
-            if result.get("s2_hs"):
-                html = patch_movie_hs2(html, number, str(result["s2_hs"]))
-            if result.get("s2_ss"):
-                html = patch_movie_ss2(html, number, str(result["s2_ss"]))
+            if hs_url:
+                html = patch_movie_hs(html, number, hs_url)
+            if ss_url:
+                html = patch_movie_ss(html, number, ss_url)
         else:
-            if result.get("dood_hs"):
-                html = patch_hs(html, number, str(result["dood_hs"]))
-            if result.get("dood_ss"):
-                html = patch_ss(html, number, str(result["dood_ss"]))
-            if result.get("s2_hs"):
-                html = patch_hs2(html, number, str(result["s2_hs"]))
-            if result.get("s2_ss"):
-                html = patch_ss2(html, number, str(result["s2_ss"]))
+            if hs_url:
+                html = patch_hs(html, number, hs_url)
+            if ss_url:
+                html = patch_ss(html, number, ss_url)
     write_html(html)
     return True
 
@@ -1171,13 +1021,13 @@ def _run_logged(cmd: list[str], check: bool = True) -> subprocess.CompletedProce
     return result
 
 
-def git_commit_push(results: list[dict[str, Any]], sync_only: bool = False) -> None:
+def git_commit_push(results: list[tuple[int, bool, str | None, str | None]], sync_only: bool = False) -> None:
     if not git_has_changes():
         print("\n  No HTML changes to commit.")
         return
 
-    ep_parts = [str(result["number"]) for result in results if not result["is_movie"] and any(result.get(key) for key in ("dood_hs", "dood_ss", "s2_hs", "s2_ss"))]
-    movie_parts = [f"M{result['number']}" for result in results if result["is_movie"] and any(result.get(key) for key in ("dood_hs", "dood_ss", "s2_hs", "s2_ss"))]
+    ep_parts = [str(number) for number, is_movie, hs, ss in results if not is_movie and (hs or ss)]
+    movie_parts = [f"M{number}" for number, is_movie, hs, ss in results if is_movie and (hs or ss)]
 
     ep_parts = sorted(set(ep_parts), key=int)
     movie_parts = sorted(set(movie_parts), key=lambda item: int(item[1:]))
@@ -1208,7 +1058,7 @@ def git_commit_push(results: list[dict[str, Any]], sync_only: bool = False) -> N
 
 # Main
 
-def run_auto_sync(results: list[dict[str, Any]]) -> None:
+def run_auto_sync(results: list[tuple[int, bool, str | None, str | None]]) -> None:
     try:
         print("\nRunning update.py bulk sync...")
         bulk_sync()
@@ -1220,6 +1070,9 @@ def run_auto_sync(results: list[dict[str, Any]]) -> None:
 def main() -> None:
     subtitle_files: list[str] = []
     all_videos: list[str] = []
+
+    if STREAMP2P_ENABLED:
+        streamp2p_auth_test()
 
     if SUBTITLE_MAGNET_LINKS:
         subtitle_magnets = parse_magnet_list(SUBTITLE_MAGNET_LINKS)
@@ -1272,7 +1125,7 @@ def main() -> None:
         sys.exit(0)
 
     print(f"\nProcessing {len(all_videos)} file(s)...")
-    results: list[dict[str, Any]] = []
+    results: list[tuple[int, bool, str | None, str | None]] = []
     for index, video in enumerate(all_videos, start=1):
         print(f"\n[{index}/{len(all_videos)}] {os.path.basename(video)}")
         try:
@@ -1286,27 +1139,15 @@ def main() -> None:
     run_auto_sync(results)
 
     print("\n-- Run summary --")
-    require_s2 = streamp2p_enabled()
-    failed: list[str] = []
-    for result in results:
-        number = int(result["number"])
-        kind = "Movie" if result["is_movie"] else "EP"
-        d1_ss = "OK" if result.get("dood_ss") else "FAIL"
-        d1_hs = "OK" if result.get("dood_hs") else "FAIL"
-        s2_ss = "OK" if result.get("s2_ss") else ("SKIP" if not require_s2 else "FAIL")
-        s2_hs = "OK" if result.get("s2_hs") else ("SKIP" if not require_s2 else "FAIL")
-        print(f"  {kind} {number:>4}  D1-SS:{d1_ss}  D1-HS:{d1_hs}  S2-SS:{s2_ss}  S2-HS:{s2_hs}")
+    for number, is_movie, hs_url, ss_url in results:
+        kind = "Movie" if is_movie else "EP"
+        hs = "OK" if hs_url else "FAIL"
+        ss = "OK" if ss_url else "FAIL"
+        print(f"  {kind} {number:>4}  SS:{ss}  HS:{hs}")
 
-        missing = []
-        if not result.get("dood_ss") or (require_s2 and not result.get("s2_ss")):
-            missing.append("SS")
-        if not result.get("dood_hs") or (require_s2 and not result.get("s2_hs")):
-            missing.append("HS")
-        if missing:
-            failed.append(f"{kind} {number} missing {'/'.join(missing)}")
-
+    failed = [number for number, _is_movie, hs, ss in results if not hs and not ss]
     if failed:
-        print(f"\n  {len(failed)} incomplete item(s): {failed}")
+        print(f"\n  {len(failed)} fully failed: {failed}")
         sys.exit(1)
 
     print(f"\n  All {len(results)} done.")
